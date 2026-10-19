@@ -1,8 +1,9 @@
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.stellar_address import is_valid_account_id
+from app.models import ScreeningResponse
 from app.stellar import score_account
+from app.stellar_address import is_valid_account_id
 
 router = APIRouter()
 
@@ -22,7 +23,7 @@ class ScoreRequest(BaseModel):
         return value
 
 
-@router.post("/score")
+@router.post("/score", response_model=ScreeningResponse, response_model_exclude_unset=True)
 def score_address(req: ScoreRequest):
     """Screen a Stellar account using its recent Horizon operations."""
     return score_account(req.address)
