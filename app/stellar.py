@@ -1,32 +1,232 @@
 """Read-only clients for Horizon and Stellar RPC."""
 from datetime import datetime, timedelta, timezone
 import base64
+import copy
+from collections import OrderedDict
+import re
+from urllib.parse import urlsplit, urlunsplit
+from email.utils import parsedate_to_datetime
+import time
+import math
+import threading
 
 import httpx
 from fastapi import HTTPException
 
 from app.config import Settings, get_settings
 
+_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+HORIZON_OPERATION_PAGE_SIZE = 200
+_screening_cache = OrderedDict()
+_screening_cache_lock = threading.Lock()
+
+
+def clear_screening_cache() -> None:
+    """Clear the bounded in-process screening cache."""
+    with _screening_cache_lock:
+        _screening_cache.clear()
+
+
+def _cached_screening(key: tuple, ttl_seconds: int):
+    if ttl_seconds <= 0:
+        return None
+    now = time.monotonic()
+    with _screening_cache_lock:
+        entry = _screening_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, result = entry
+        if expires_at <= now:
+            del _screening_cache[key]
+            return None
+        _screening_cache.move_to_end(key)
+        return copy.deepcopy(result)
+
+
+def _store_screening(key: tuple, result: dict, settings: Settings) -> None:
+    if settings.screening_cache_ttl_seconds <= 0:
+        return
+    with _screening_cache_lock:
+        _screening_cache[key] = (
+            time.monotonic() + settings.screening_cache_ttl_seconds,
+            copy.deepcopy(result),
+        )
+        _screening_cache.move_to_end(key)
+        while len(_screening_cache) > settings.screening_cache_max_entries:
+            _screening_cache.popitem(last=False)
+
+
+def _retry_after_seconds(response: httpx.Response, settings: Settings, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    delay = None
+    if retry_after:
+        try:
+            delay = max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+    if delay is None:
+        delay = settings.upstream_retry_backoff_seconds * (2 ** attempt)
+    return min(delay, settings.upstream_retry_after_cap_seconds)
+
+
+def _request_with_retries(method, url: str, settings: Settings, **kwargs) -> httpx.Response:
+    retries = settings.upstream_max_retries
+    for attempt in range(retries + 1):
+        try:
+            response = method(url, **kwargs)
+        except httpx.TransportError:
+            if attempt >= retries:
+                raise
+            delay = settings.upstream_retry_backoff_seconds * (2 ** attempt)
+            time.sleep(min(delay, settings.upstream_retry_after_cap_seconds))
+            continue
+
+        if response.status_code in _RETRYABLE_STATUS_CODES and attempt < retries:
+            time.sleep(_retry_after_seconds(response, settings, attempt))
+            continue
+        return response
+
+    raise RuntimeError("upstream retry loop ended unexpectedly")
+_http_client: httpx.Client | None = None
+
+
+def set_http_client(client: httpx.Client) -> None:
+    """Install the application-scoped connection pool used by upstream calls."""
+    global _http_client
+    if _http_client is not None and _http_client is not client:
+        _http_client.close()
+    _http_client = client
+
+
+def close_http_client() -> None:
+    """Close and clear the application-scoped connection pool."""
+    global _http_client
+    client, _http_client = _http_client, None
+    if client is not None:
+        client.close()
+
+
+def _get_response(url: str, params: dict | None, settings: Settings):
+    if _http_client is not None:
+        return _http_client.get(url, params=params, timeout=settings.request_timeout_seconds)
+    return httpx.get(url, params=params, timeout=settings.request_timeout_seconds)
+
+
+def _post_response(url: str, payload: dict, settings: Settings):
+    if _http_client is not None:
+        return _http_client.post(url, json=payload, timeout=settings.request_timeout_seconds)
+    return httpx.post(url, json=payload, timeout=settings.request_timeout_seconds)
+
+
+def _finite_float(value) -> float:
+    """Parse an upstream numeric field without allowing NaN or infinity through."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _public_endpoint(url: str) -> str:
+    """Remove credentials and opaque query data before exposing an endpoint URL."""
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+    except ValueError:
+        return "[redacted]"
+    if hostname is None:
+        return f"{parts.scheme}://[redacted]" if parts.scheme else "[redacted]"
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parts.port
+    except ValueError:
+        return f"{parts.scheme}://[redacted]"
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
 
 def _get(url: str, params: dict | None = None, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     try:
-        response = httpx.get(url, params=params, timeout=settings.request_timeout_seconds)
+        response = _request_with_retries(
+            lambda target, **kwargs: _get_response(target, kwargs.get("params"), settings),
+            url,
+            settings,
+            params=params,
+            timeout=settings.request_timeout_seconds,
+        )
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Stellar account was not found on the configured network") from exc
         raise HTTPException(status_code=502, detail="Horizon request failed") from exc
-    except (httpx.HTTPError, ValueError) as exc:
+    except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="Unable to reach the configured Stellar data service") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Horizon returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Horizon returned an invalid response")
+    return payload
+
+
+def _asset_context(account: dict) -> tuple[list[dict], int, float]:
+    assets = []
+    trustline_count = 0
+    native_balance = 0.0
+    balances = account.get("balances", [])
+    if not isinstance(balances, list):
+        return assets, trustline_count, native_balance
+
+    for balance in balances:
+        if not isinstance(balance, dict):
+            continue
+        asset_type = balance.get("asset_type")
+        amount = balance.get("balance")
+        if not isinstance(asset_type, str) or amount is None:
+            continue
+        try:
+            numeric_amount = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric_amount):
+            continue
+
+        if asset_type == "native":
+            native_balance = numeric_amount
+            asset = {"type": "native", "code": "XLM"}
+        else:
+            asset = {"type": asset_type}
+            if balance.get("asset_code") is not None:
+                asset["code"] = balance["asset_code"]
+            if balance.get("asset_issuer") is not None:
+                asset["issuer"] = balance["asset_issuer"]
+            if asset_type.startswith("credit_") and not (
+                asset.get("code") and asset.get("issuer")
+            ):
+                continue
+            if balance.get("liquidity_pool_id") is not None:
+                asset["liquidity_pool_id"] = balance["liquidity_pool_id"]
+            trustline_count += 1
+        assets.append({"asset": asset, "balance": str(amount)})
+
+    return assets, trustline_count, native_balance
 
 
 def _rpc(method: str, params: dict, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     try:
-        response = httpx.post(
+        response = _request_with_retries(
+            lambda target, **kwargs: _post_response(target, kwargs.get("json"), settings),
             settings.soroban_rpc_url,
+            settings,
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             timeout=settings.request_timeout_seconds,
         )
@@ -34,26 +234,90 @@ def _rpc(method: str, params: dict, settings: Settings | None = None) -> dict:
         payload = response.json()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail="Soroban RPC request failed") from exc
-    except (httpx.HTTPError, ValueError) as exc:
+    except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="Unable to reach configured Soroban RPC") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Soroban RPC returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Soroban RPC returned an invalid response")
     if payload.get("error"):
         raise HTTPException(status_code=502, detail="Soroban RPC returned an error")
-    return payload.get("result", {})
+    result = payload.get("result", {})
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Soroban RPC returned an invalid result")
+    return result
+
+
+def _scan_account_operations(address: str, settings: Settings) -> tuple[list[dict], int, bool]:
+    """Read the bounded recent-operation sample across Horizon pages."""
+    scan_limit = settings.operation_scan_limit
+    if scan_limit <= 0:
+        return [], scan_limit, False
+
+    url = f"{settings.horizon_url.rstrip('/')}/accounts/{address}/operations"
+    records: list[dict] = []
+    cursor: str | None = None
+    may_be_incomplete = False
+    while len(records) < scan_limit:
+        page_limit = min(HORIZON_OPERATION_PAGE_SIZE, scan_limit - len(records))
+        params = {"limit": page_limit, "order": "desc", "include_failed": "false"}
+        if cursor is not None:
+            params["cursor"] = cursor
+        payload = _get(url, params=params, settings=settings)
+        embedded = payload.get("_embedded")
+        page = embedded.get("records", []) if isinstance(embedded, dict) else []
+        if not isinstance(page, list) or not page:
+            break
+        page_records = [record for record in page[:page_limit] if isinstance(record, dict)]
+        if not page_records:
+            break
+        records.extend(page_records)
+
+        if len(records) >= scan_limit:
+            may_be_incomplete = len(page) >= page_limit
+            break
+        if len(page) < page_limit:
+            break
+
+        next_cursor = page_records[-1].get("id")
+        if next_cursor is None or str(next_cursor) == cursor:
+            may_be_incomplete = True
+            break
+        cursor = str(next_cursor)
+
+    return records, scan_limit, may_be_incomplete
 
 
 def score_account(address: str, settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
+    key = (
+        settings.network_passphrase,
+        settings.horizon_url.rstrip("/"),
+        address,
+        settings.model_dump_json(),
+    )
+    cached = _cached_screening(key, settings.screening_cache_ttl_seconds)
+    if cached is not None:
+        return cached
+    result = _score_account_uncached(address, settings)
+    _store_screening(key, result, settings)
+    return copy.deepcopy(result)
+
+
+def _score_account_uncached(address: str, settings: Settings) -> dict:
     account = _get(f"{settings.horizon_url.rstrip('/')}/accounts/{address}", settings=settings)
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(days=settings.activity_window_days)
-    ops_url = f"{settings.horizon_url.rstrip('/')}/accounts/{address}/operations"
-    ops = _get(ops_url, {"limit": min(settings.operation_scan_limit, 200), "order": "desc", "include_failed": "false"}, settings)
-    records = ops.get("_embedded", {}).get("records", [])
+    records, scan_limit, may_be_incomplete = _scan_account_operations(address, settings)
     recent = []
     for op in records:
+        if not isinstance(op, dict) or not isinstance(op.get("created_at"), str):
+            continue
         try:
             created = datetime.fromisoformat(op["created_at"].replace("Z", "+00:00"))
-        except (KeyError, ValueError):
+        except (ValueError, OverflowError):
+            continue
+        if created.tzinfo is None:
             continue
         if created >= window_start:
             recent.append(op)
@@ -68,14 +332,11 @@ def score_account(address: str, settings: Settings | None = None) -> dict:
         for account_id in (source, destination, op.get("from")):
             if account_id and account_id != address:
                 counterparties.add(account_id)
-        try:
-            # Only native XLM amounts are included; asset amounts are never mixed into XLM totals.
-            if op.get("type") == "create_account":
-                volume += abs(float(op.get("starting_balance", "0")))
-            elif op.get("asset_type") in (None, "native"):
-                volume += abs(float(op.get("amount", "0")))
-        except (TypeError, ValueError):
-            pass
+        # Only native XLM amounts are included; asset amounts are never mixed into XLM totals.
+        if op.get("type") == "create_account":
+            volume += abs(_finite_float(op.get("starting_balance", "0")))
+        elif op.get("asset_type") in (None, "native"):
+            volume += abs(_finite_float(op.get("amount", "0")))
         transfers += 1
 
     signals = []
@@ -87,52 +348,152 @@ def score_account(address: str, settings: Settings | None = None) -> dict:
                         "points": points, "explanation": explanation,
                         "source": "Stellar Horizon account operations", "window": f"last {settings.activity_window_days} days"})
 
-    if len(recent) >= 50:
-        add_signal("activity_burst", "High recent operation count", len(recent), "elevated", 25,
-                   "At least 50 operations were observed within the screening window.")
-    if volume >= 10_000:
-        add_signal("transfer_volume", "High native XLM transfer volume", round(volume, 7), "elevated", 25,
-                   "Observed native XLM transfer volume reached 10,000 XLM in the window.")
-    if len(counterparties) >= 20:
-        add_signal("counterparty_spread", "Broad counterparty spread", len(counterparties), "elevated", 25,
-                   "At least 20 distinct counterparties appeared in observed transfer operations.")
+    if len(recent) >= settings.risk_activity_burst_min_operations:
+        operation_count = settings.risk_activity_burst_min_operations
+        operation_noun = "operation" if operation_count == 1 else "operations"
+        operation_verb = "was" if operation_count == 1 else "were"
+        add_signal(
+            "activity_burst", "High recent operation count", len(recent), "elevated",
+            settings.risk_activity_burst_points,
+            f"At least {operation_count} {operation_noun} {operation_verb} observed within the screening window.",
+        )
+    if volume >= settings.risk_transfer_volume_xlm_threshold:
+        add_signal(
+            "transfer_volume", "High native XLM transfer volume", round(volume, 7), "elevated",
+            settings.risk_transfer_volume_points,
+            f"Observed native XLM transfer volume reached {settings.risk_transfer_volume_xlm_threshold:g} XLM in the window.",
+        )
+    if len(counterparties) >= settings.risk_counterparty_min_count:
+        add_signal(
+            "counterparty_spread", "Broad counterparty spread", len(counterparties), "elevated",
+            settings.risk_counterparty_points,
+            f"At least {settings.risk_counterparty_min_count} distinct counterparties appeared in observed transfer operations.",
+        )
     sequence = account.get("sequence", "0")
     # A low operation sequence is a weak context signal, not a conclusion about legitimacy.
     try:
         seq = int(sequence)
     except (TypeError, ValueError):
         seq = 0
-    if seq <= 5 and recent:
-        add_signal("new_account_activity", "Low sequence account with observed activity", seq, "review", 15,
-                   "The account has a low sequence number; this alone is not evidence of malicious behavior.")
+    if seq <= settings.risk_low_sequence_max and recent:
+        add_signal(
+            "new_account_activity", "Low sequence account with observed activity", seq, "review",
+            settings.risk_low_sequence_points,
+            f"The account sequence is at most {settings.risk_low_sequence_max}; this alone is not evidence of malicious behavior.",
+        )
 
-    native_balance = next((float(item["balance"]) for item in account.get("balances", [])
-                           if item.get("asset_type") == "native" and item.get("balance") is not None), 0.0)
+    assets, trustline_count, native_balance = _asset_context(account)
 
     score = min(score, 100)
-    threshold = 70
+    threshold = settings.risk_high_score_threshold
     return {
         "address": address,
         "score": score,
-        "risk_level": "high" if score >= threshold else "elevated" if score >= 40 else "low",
+        "risk_level": "high" if score >= threshold else "elevated" if score >= settings.risk_elevated_score_threshold else "low",
         "threshold": threshold,
         "threshold_exceeded": score >= threshold,
+        "scoring_policy_version": settings.risk_policy_version,
         "signals": signals,
         "metrics": {"operations_scanned": len(records), "operations_in_window": len(recent),
                     "transfers_in_window": transfers, "transfer_volume_xlm": round(volume, 7),
                     "distinct_counterparties": len(counterparties), "account_sequence": seq,
-                    "native_xlm_balance": round(native_balance, 7), "window_days": settings.activity_window_days},
-        "source": {"horizon_url": settings.horizon_url.rstrip("/"), "network": settings.network_passphrase,
+                    "native_xlm_balance": round(native_balance, 7), "trustline_count": trustline_count,
+                    "window_days": settings.activity_window_days},
+        "activity_sample": {
+            "operations_scanned": len(records),
+            "scan_limit": scan_limit,
+            "may_be_incomplete": may_be_incomplete,
+        },
+        "assets": assets,
+        "source": {"horizon_url": _public_endpoint(settings.horizon_url.rstrip("/")), "network": settings.network_passphrase,
                    "observed_at": now.isoformat()},
         "as_of": now.isoformat(),
         "on_chain_action": "none",
     }
 
 
+def _asset_details(operation: dict, prefix: str = "") -> dict:
+    field = lambda suffix: operation.get(f"{prefix}{suffix}")
+    asset_type = field("asset_type") or ("native" if not prefix else None)
+    asset = {"type": asset_type}
+    code = field("asset_code")
+    issuer = field("asset_issuer")
+    if code is not None:
+        asset["code"] = code
+    if issuer is not None:
+        asset["issuer"] = issuer
+    return asset
+
+
+def _normalize_operation(operation: dict) -> dict:
+    op_type = operation.get("type")
+    amounts = []
+    if op_type in {"path_payment_strict_receive", "path_payment_strict_send"}:
+        if operation.get("source_amount") is not None:
+            amounts.append({
+                "kind": "source",
+                "value": str(operation["source_amount"]),
+                "asset": _asset_details(operation, "source_"),
+            })
+        if operation.get("amount") is not None:
+            amounts.append({
+                "kind": "destination",
+                "value": str(operation["amount"]),
+                "asset": _asset_details(operation),
+            })
+    else:
+        value = operation.get("amount")
+        if value is None and op_type == "create_account":
+            value = operation.get("starting_balance")
+        if value is not None:
+            amounts.append({"kind": "amount", "value": str(value), "asset": _asset_details(operation)})
+
+    return {
+        "id": operation.get("id"),
+        "type": op_type,
+        "created_at": operation.get("created_at"),
+        "transaction_hash": operation.get("transaction_hash"),
+        "source_account": operation.get("source_account"),
+        "from_account": operation.get("from"),
+        "to_account": operation.get("to"),
+        "amounts": amounts,
+    }
+
+
+def list_account_operations(address: str, limit: int, cursor: str | None = None,
+                            settings: Settings | None = None) -> dict:
+    settings = settings or get_settings()
+    horizon_cursor = None
+    if cursor:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            horizon_cursor = base64.urlsafe_b64decode(cursor + padding).decode("ascii")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid operations cursor") from exc
+        if not horizon_cursor.isdigit():
+            raise HTTPException(status_code=422, detail="Invalid operations cursor")
+
+    params = {"limit": limit, "order": "desc", "include_failed": "false"}
+    if horizon_cursor:
+        params["cursor"] = horizon_cursor
+    url = f"{settings.horizon_url.rstrip('/')}/accounts/{address}/operations"
+    payload = _get(url, params=params, settings=settings)
+    records = payload.get("_embedded", {}).get("records", [])
+    next_cursor = None
+    if len(records) == limit and records[-1].get("id") is not None:
+        next_cursor = base64.urlsafe_b64encode(str(records[-1]["id"]).encode("ascii")).decode("ascii").rstrip("=")
+    return {
+        "operations": [_normalize_operation(record) for record in records],
+        "next_cursor": next_cursor,
+        "limit": limit,
+        "source": {"horizon_url": _public_endpoint(settings.horizon_url.rstrip("/")), "network": settings.network_passphrase},
+    }
+
+
 def network_status(settings: Settings | None = None) -> dict:
     settings = settings or get_settings()
     health = _rpc("getHealth", {}, settings)
-    return {"network": settings.network_passphrase, "rpc_url": settings.soroban_rpc_url,
+    return {"network": settings.network_passphrase, "rpc_url": _public_endpoint(settings.soroban_rpc_url),
             "status": health.get("status", "unknown"), "latest_ledger": health.get("latestLedger"),
             "oldest_ledger": health.get("oldestLedger"),
             "ledger_retention_window": health.get("ledgerRetentionWindow"),
@@ -159,14 +520,26 @@ def _native(value):
     return value
 
 
+def _bytes32_hex(value) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("bytes")
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        return value.lower()
+    return None
+
+
 def fetch_flag_event_page(limit: int, cursor: str | None = None,
                           settings: Settings | None = None) -> tuple[list[dict], str | None]:
     settings = settings or get_settings()
     if not settings.contract_id:
         raise HTTPException(status_code=503, detail="CONTRACT_ID is required to read Stellar Sentinel on-chain events")
     params = {
-        "filters": [{"type": "contract", "contractIds": [settings.contract_id],
-                     "topics": [[_symbol_scval("flagged"), "*", "*", "**"]]}],
+        "filters": [
+            {"type": "contract", "contractIds": [settings.contract_id],
+             "topics": [[_symbol_scval("flagged"), "*", "*", "**"]]},
+            {"type": "contract", "contractIds": [settings.contract_id],
+             "topics": [[_symbol_scval("flaggedv2"), "*", "*", "*"]]},
+        ],
         "pagination": {"limit": limit},
         "xdrFormat": "json",
     }
@@ -182,9 +555,11 @@ def fetch_flag_event_page(limit: int, cursor: str | None = None,
     output = []
     for event in result.get("events", []):
         topics = [_native(topic) for topic in event.get("topic", event.get("topics", []))]
+        is_v2 = bool(topics) and topics[0] == "flaggedv2"
         output.append({"id": event.get("id"), "ledger": event.get("ledger"),
                        "created_at": event.get("ledgerClosedAt"), "agent": topics[1] if len(topics) > 1 else None,
                        "subject": topics[2] if len(topics) > 2 else None, "score": _native(event.get("value")),
+                       "report_digest": _bytes32_hex(topics[3]) if is_v2 and len(topics) > 3 else None,
                        "contract_id": event.get("contractId", settings.contract_id), "tx_hash": event.get("txHash")})
     return output, result.get("cursor")
 
@@ -193,7 +568,7 @@ def list_flag_events(limit: int, cursor: str | None = None, settings: Settings |
     settings = settings or get_settings()
     output, next_cursor = fetch_flag_event_page(limit, cursor, settings)
     return {"events": output, "next_cursor": next_cursor,
-            "source": {"rpc_url": settings.soroban_rpc_url, "network": settings.network_passphrase,
+            "source": {"rpc_url": _public_endpoint(settings.soroban_rpc_url), "network": settings.network_passphrase,
                        "contract_id": settings.contract_id}}
 
 
